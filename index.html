@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FARAZ KAYAN — Digital Templates & Creative Resources</title>
+    <meta
+      name="description"
+      content="Thoughtfully designed presentation templates, Canva resources, and digital design assets by Faraz Kayan Haque (@farazkayan)."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FARAZ KAYAN" />
+    <meta property="og:title" content="FARAZ KAYAN — Digital Templates & Creative Resources" />
+    <meta
+      property="og:description"
+      content="Thoughtfully designed templates and digital resources for better presentations, creative work and everything in between."
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="FARAZ KAYAN — Digital Templates & Creative Resources" />
+    <meta
+      name="twitter:description"
+      content="Thoughtfully designed templates and digital resources for better presentations, creative work and everything in between."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700;12..96,800&family=Caveat:wght@500;600&family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem('farazkayan-theme');
+          var prefersDark =
+            window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (stored === 'dark' || (!stored && prefersDark)) {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body class="bg-[#FFF7E8] text-[#24211D] dark:bg-[#181613] dark:text-[#F5EDE0] antialiased selection:bg-[#4169E1]/20 dark:selection:bg-[#6B8FF7]/25">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
