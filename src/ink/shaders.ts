@@ -12,12 +12,12 @@ void main() {
 }`;
 
 /**
- * Ink bleed between two full-document snapshots.
+ * Ink bleed between two viewport snapshots (or live-DOM alpha reveal when uRevealAlpha > 0.5).
  *
  * Coordinate spaces:
  *  - device px:  gl_FragCoord, flipped to top-left origin
  *  - CSS px:     device px / uCanvasScale (viewport-relative)
- *  - texture px: device px * map.x + map.yz (scale ratio + scroll offset in whole texels);
+ *  - texture px: device px * map.x + map.yz (scale ratio + scroll delta in whole texels);
  *                map.w = 1 flips Y for framebuffer-rendered sources (the frozen composite)
  *  - noise space: (CSS px - click) / uRef, so the pattern scales with the viewport
  *
@@ -54,6 +54,7 @@ uniform float uNoiseScale;  // noise frequency multiplier
 uniform float uSoftness;    // frontier half-width, CSS px
 uniform float uDrift;       // time evolution speed
 uniform vec3 uRimColor;     // pigment colour pooled at the frontier
+uniform float uRevealAlpha; // 0 = dual-texture opaque mix, 1 = alpha-cutout revealing live DOM
 
 out vec4 outColor;
 
@@ -124,7 +125,11 @@ void main() {
   float inner = R * (1.0 - A_SUM) + cleanup - FIBRE_PX - THIN_MAX_PX - uSoftness * 2.0;
   float outer = R * (1.0 + A_SUM) * (1.0 + TENDRIL_REACH * uTendril) + cleanup + FIBRE_PX + SPECK_PX + uSoftness * 2.0;
   if (d < inner) {
-    outColor = vec4(sampleDoc(uTo, uToSize, uToMap, devPx), 1.0);
+    if (uRevealAlpha > 0.5) {
+      outColor = vec4(0.0, 0.0, 0.0, 0.0);
+    } else {
+      outColor = vec4(sampleDoc(uTo, uToSize, uToMap, devPx), 1.0);
+    }
     return;
   }
   if (d > outer) {
@@ -204,12 +209,21 @@ void main() {
   }
 
   vec3 from = sampleDoc(uFrom, uFromSize, uFromMap, devPx);
-  vec3 to = sampleDoc(uTo, uToSize, uToMap, devPx);
-  vec3 col = mix(from, to, cov);
-
   // Pigment rim pooled at the frontier (darker for ink, brighter for bleach).
   float rimX = (f + soft * 1.1) / (soft * 1.4 + 1.2);
   float rim = exp(-rimX * rimX) * inked;
+
+  if (uRevealAlpha > 0.5) {
+    // Live-DOM alpha reveal: old theme dissolves along the exact ink-bleed frontier,
+    // leaving the pooled pigment rim while uncovering the live target-theme DOM underneath.
+    float outAlpha = clamp((1.0 - cov) + rim * 0.55, 0.0, 1.0);
+    vec3 col = mix(from, uRimColor, clamp(rim * 0.72 + cov * 0.25, 0.0, 1.0));
+    outColor = vec4(col, outAlpha);
+    return;
+  }
+
+  vec3 to = sampleDoc(uTo, uToSize, uToMap, devPx);
+  vec3 col = mix(from, to, cov);
   col = mix(col, uRimColor, rim * 0.45);
 
   outColor = vec4(col, 1.0);

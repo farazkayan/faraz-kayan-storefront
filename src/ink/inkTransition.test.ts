@@ -4,6 +4,7 @@ import {
   HTML2CANVAS_PRO_CDN_URL,
   HTML2CANVAS_PRO_VERSION,
 } from './capture';
+import { isInkDebugEnabled } from './debug';
 import {
   computeSpreadMetrics,
   easePower3Out,
@@ -11,6 +12,12 @@ import {
   resolveToggleOrigin,
 } from './inkTransition';
 import { inkParams, RIM_COLOR, SPREAD, THEME_BG } from './params';
+import { canUseIframeCloner } from './viewportRasterizer';
+
+test('ink diagnostics default off and iframe cloner probe is SSR-safe', () => {
+  assert.equal(isInkDebugEnabled(), false);
+  assert.equal(canUseIframeCloner(), false);
+});
 
 test('HTML2CANVAS_PRO_CDN_URL uses a pinned versioned jsDelivr ESM URL', () => {
   assert.match(HTML2CANVAS_PRO_VERSION, /^\d+\.\d+\.\d+$/);

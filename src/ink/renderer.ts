@@ -4,6 +4,7 @@
  */
 import type { ThemeMode } from '../utils/theme';
 import type { Snapshot } from './capture';
+import { inkDebug, inkDebugError } from './debug';
 import { createNoiseTexture } from './noiseTexture';
 import { inkParams, RIM_COLOR } from './params';
 import { createProgram, type Program } from './program';
@@ -15,6 +16,9 @@ interface ThemeTexture {
   height: number;
   scale: number;
   key: string;
+  isViewport: boolean;
+  scrollX: number;
+  scrollY: number;
 }
 
 /** Offscreen copy of what the overlay showed when a transition was interrupted. */
@@ -34,6 +38,8 @@ export type InkSource = ThemeMode | 'composite';
 export interface InkFrame {
   from: InkSource;
   to: ThemeMode;
+  /** When true, cuts alpha through `uFrom` to reveal the live target-theme DOM underneath. */
+  revealAlpha?: boolean;
   /** Click point, CSS px relative to the viewport. */
   center: { x: number; y: number };
   /** Eased 0..1. */
@@ -56,7 +62,7 @@ interface Sampler {
   height: number;
   /** Texture px per canvas device px. */
   ratio: number;
-  /** Texture px added after scaling (scroll), already rounded to whole texels. */
+  /** Texture px added after scaling (scroll delta), already rounded to whole texels. */
   offsetX: number;
   offsetY: number;
   /** True for framebuffer-rendered sources (GL's bottom-up Y vs. canvas top-down Y). */
@@ -85,7 +91,7 @@ export class InkRenderer {
     let gl: WebGL2RenderingContext | null = null;
     try {
       gl = canvas.getContext('webgl2', {
-        alpha: false, // opaque: CSS opacity fades it straight onto the live DOM
+        alpha: true, // supports both opaque dual-texture mode and live-DOM alpha-cutout reveal
         antialias: false,
         depth: false,
         stencil: false,
@@ -93,13 +99,24 @@ export class InkRenderer {
         preserveDrawingBuffer: false,
         powerPreference: 'high-performance',
       });
-    } catch {
+    } catch (err) {
+      inkDebugError('H', 'WebGL2 context creation threw', err);
       return null;
     }
+
+    inkDebug('H', 'WebGL2 context availability check', {
+      available: Boolean(gl),
+    });
     if (!gl) return null;
+
     try {
-      return new InkRenderer(canvas, gl);
-    } catch {
+      const renderer = new InkRenderer(canvas, gl);
+      inkDebug('I', 'WebGL2 renderer initialized successfully', {
+        maxTextureSize: renderer.maxTextureSize,
+      });
+      return renderer;
+    } catch (err) {
+      inkDebugError('I', 'WebGL2 renderer initialization failed', err);
       return null;
     }
   }
@@ -107,13 +124,21 @@ export class InkRenderer {
   private constructor(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext) {
     this.canvas = canvas;
     this.gl = gl;
-    this.maxTextureSize = (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
+    this.maxTextureSize =
+      (gl.getParameter(gl.MAX_TEXTURE_SIZE) as number) || 4096;
     this.init();
   }
 
   private init(): void {
     const gl = this.gl;
-    this.program = createProgram(gl, FULLSCREEN_VERT, INK_FRAG);
+    try {
+      this.program = createProgram(gl, FULLSCREEN_VERT, INK_FRAG);
+      inkDebug('J', 'Ink shaders compiled and linked successfully');
+    } catch (err) {
+      inkDebugError('J', 'Ink shader compilation/linking failed', err);
+      throw err;
+    }
+
     const vao = gl.createVertexArray();
     if (!vao) throw new Error('createVertexArray failed');
     this.vao = vao;
@@ -134,6 +159,7 @@ export class InkRenderer {
       this.textures.clear();
       this.composites = [];
       this.activeComposite = -1;
+      inkDebug('I', 'WebGL2 context lost');
       onLost();
     };
     this.contextRestoredHandler = () => {
@@ -141,9 +167,11 @@ export class InkRenderer {
       this.lost = false;
       try {
         this.init();
+        inkDebug('I', 'WebGL2 context restored');
         onRestored();
-      } catch {
+      } catch (err) {
         this.lost = true;
+        inkDebugError('I', 'WebGL2 context restore failed', err);
       }
     };
     this.canvas.addEventListener('webglcontextlost', this.contextLostHandler);
@@ -187,51 +215,74 @@ export class InkRenderer {
     this.canvasScale = cssWidth > 0 ? w / cssWidth : scale;
   }
 
-  upload(snapshot: Snapshot): void {
-    if (this.isLost) return;
+  upload(snapshot: Snapshot): boolean {
+    if (this.isLost) return false;
     const gl = this.gl;
-    let entry = this.textures.get(snapshot.theme);
-    if (!entry) {
-      entry = {
-        texture: this.createTexture(),
-        width: 0,
-        height: 0,
-        scale: 0,
-        key: '',
-      };
-      this.textures.set(snapshot.theme, entry);
+    try {
+      let entry = this.textures.get(snapshot.theme);
+      if (!entry) {
+        entry = {
+          texture: this.createTexture(),
+          width: 0,
+          height: 0,
+          scale: 0,
+          key: '',
+          isViewport: true,
+          scrollX: 0,
+          scrollY: 0,
+        };
+        this.textures.set(snapshot.theme, entry);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, entry.texture);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA8,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        snapshot.canvas
+      );
+      entry.width = snapshot.canvas.width;
+      entry.height = snapshot.canvas.height;
+      entry.scale = snapshot.scale;
+      entry.key = snapshot.key;
+      entry.isViewport = snapshot.isViewport;
+      entry.scrollX = snapshot.scrollX;
+      entry.scrollY = snapshot.scrollY;
+      inkDebug('K', 'Texture uploaded to WebGL2', {
+        theme: snapshot.theme,
+        width: entry.width,
+        height: entry.height,
+        scale: entry.scale,
+      });
+      return true;
+    } catch (err) {
+      inkDebugError('K', 'Texture upload failed', err, {
+        theme: snapshot.theme,
+      });
+      return false;
     }
-    gl.bindTexture(gl.TEXTURE_2D, entry.texture);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA8,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      snapshot.canvas
-    );
-    entry.width = snapshot.canvas.width;
-    entry.height = snapshot.canvas.height;
-    entry.scale = snapshot.scale;
-    entry.key = snapshot.key;
   }
 
-  /** True when a snapshot for `theme` exists and matches the current layout. */
+  /** True when a snapshot for `theme` exists and matches the current viewport key. */
   hasValid(theme: ThemeMode, key: string): boolean {
     return !this.isLost && this.textures.get(theme)?.key === key;
   }
 
   /**
-   * Renders `frame` (normally: exactly what is on screen) into an offscreen texture that
-   * later frames can use as `from: 'composite'`. Two textures ping-pong, so a frame that
-   * itself reads the composite can be frozen again (rapid triple-clicks).
+   * Renders `frame` into an offscreen texture that later frames can use as `from: 'composite'`.
+   * Two textures ping-pong, so a frame that reads the composite can be frozen again.
    */
   freeze(frame: InkFrame): boolean {
-    if (this.isLost) return false;
+    if (this.isLost || frame.revealAlpha) return false;
     const gl = this.gl;
     const index = this.activeComposite === 0 ? 1 : 0;
     const target = this.ensureComposite(index);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.framebuffer);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return false;
+    }
     const ok = this.render(frame);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     if (!ok) return false;
@@ -241,9 +292,9 @@ export class InkRenderer {
     return true;
   }
 
-  draw(frame: InkFrame): void {
-    if (this.isLost) return;
-    this.render(frame);
+  draw(frame: InkFrame): boolean {
+    if (this.isLost) return false;
+    return this.render(frame);
   }
 
   /** Release all GPU resources and event listeners cleanly. */
@@ -334,7 +385,6 @@ export class InkRenderer {
     if (source === 'composite') {
       const c = this.composites[this.activeComposite];
       if (!c) return null;
-      // Keep the frozen frame glued to the page if the user scrolls mid-transition.
       return {
         texture: c.texture,
         width: c.width,
@@ -347,25 +397,29 @@ export class InkRenderer {
     }
     const t = this.textures.get(source);
     if (!t) return null;
+    const deltaScrollX = t.isViewport ? window.scrollX - t.scrollX : window.scrollX;
+    const deltaScrollY = t.isViewport ? window.scrollY - t.scrollY : window.scrollY;
     return {
       texture: t.texture,
       width: t.width,
       height: t.height,
       ratio: t.scale / this.canvasScale,
-      offsetX: Math.floor(window.scrollX * t.scale + 0.5),
-      offsetY: Math.floor(window.scrollY * t.scale + 0.5),
+      offsetX: Math.floor(deltaScrollX * t.scale + 0.5),
+      offsetY: Math.floor(deltaScrollY * t.scale + 0.5),
       flipY: false,
     };
   }
 
   private render(frame: InkFrame): boolean {
     const from = this.sampler(frame.from);
-    const to = this.sampler(frame.to);
+    const to = frame.revealAlpha ? from : this.sampler(frame.to);
     if (!from || !to) return false;
 
     const gl = this.gl;
     const { program, uniform } = this.program;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(program);
     gl.bindVertexArray(this.vao);
 
@@ -415,6 +469,7 @@ export class InkRenderer {
     gl.uniform1f(uniform('uSoftness'), inkParams.softness);
     gl.uniform1f(uniform('uDrift'), inkParams.drift);
     gl.uniform3fv(uniform('uRimColor'), RIM_COLOR[frame.to]);
+    gl.uniform1f(uniform('uRevealAlpha'), frame.revealAlpha ? 1 : 0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     return true;

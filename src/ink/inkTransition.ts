@@ -3,9 +3,16 @@
  * https://github.com/codemure-official/ink-bleed-theme-changer
  */
 import { toggleThemeValue, type ThemeMode } from '../utils/theme';
-import { capturePage, layoutKey, renderScale } from './capture';
+import {
+  capturePage,
+  loadHtml2CanvasPro,
+  renderScale,
+  viewportKey,
+} from './capture';
+import { inkDebug, inkDebugError } from './debug';
 import { inkParams, SPREAD } from './params';
 import { InkRenderer, type InkFrame, type InkSource } from './renderer';
+import { canUseIframeCloner, rasterizeViewport } from './viewportRasterizer';
 
 export interface Point {
   x: number;
@@ -13,9 +20,9 @@ export interface Point {
 }
 
 const FADE_OUT_S = 0.15;
-const RESIZE_DEBOUNCE_MS = 250;
-/** CSS cross-fade used without WebGL2 or before snapshots are ready. */
-const CSS_FADE_S = 0.42;
+const RESIZE_DEBOUNCE_MS = 300;
+/** CSS cross-fade used only when WebGL2 is unavailable or fails. */
+const CSS_FADE_S = 0.35;
 
 type ActiveFrame = Omit<InkFrame, 'progress' | 'radius' | 'time' | 'cleanup'>;
 
@@ -103,6 +110,30 @@ function randomSeed(): InkFrame['seed'] {
   };
 }
 
+function scheduleIdle(cb: () => void, timeoutMs = 1500): number {
+  if (typeof window === 'undefined') return 0;
+  const w = window as Window & {
+    requestIdleCallback?: (
+      callback: () => void,
+      options?: { timeout: number }
+    ) => number;
+  };
+  if (typeof w.requestIdleCallback === 'function') {
+    return w.requestIdleCallback(cb, { timeout: timeoutMs });
+  }
+  return window.setTimeout(cb, 250);
+}
+
+function cancelIdle(id: number): void {
+  if (!id || typeof window === 'undefined') return;
+  const w = window as Window & { cancelIdleCallback?: (handle: number) => void };
+  if (typeof w.cancelIdleCallback === 'function') {
+    w.cancelIdleCallback(id);
+  } else {
+    window.clearTimeout(id);
+  }
+}
+
 export interface InkTransitionOptions {
   canvas: HTMLCanvasElement;
   getTheme: () => ThemeMode;
@@ -112,18 +143,21 @@ export interface InkTransitionOptions {
 
 /**
  * Orchestrates the ink-bleed theme transition:
- *  1. Keeps fresh snapshots of both themes on the GPU (pre-captured, re-captured on layout change).
- *  2. On toggle, covers the viewport with the "from" snapshot, flips the live DOM underneath,
- *     spreads the organic ink across the viewport, then fades the overlay away.
- *  3. If toggled mid-spread, freezes the current GPU frame and spreads the opposite ink over it.
- *  4. Falls back cleanly to a CSS cross-fade without WebGL2 or before snapshots are ready,
- *     and to a quick accessible switch under `prefers-reduced-motion: reduce`.
+ *  1. On non-sandboxed hosts, preloads html2canvas-pro & prepares viewport snapshots during idle time.
+ *  2. On toggle:
+ *     - If fresh dual-theme viewport snapshots exist, runs the exact opaque dual-texture shader.
+ *     - Otherwise (including inside Gumroad's strict CSP sandboxed iframe where DocumentCloner's
+ *       internal iframe is blocked, or on immediate first-click), captures the visible viewport
+ *       directly via `rasterizeViewport()` (~10-25ms, zero iframes, taint-safe) and runs the
+ *       exact Codemure WebGL2 ink-bleed shader in live-DOM alpha-reveal mode.
+ *  3. Only falls back to CSS cross-fade when WebGL2 is unavailable/lost or reduced motion is enabled.
  */
 export class InkTransition {
   private readonly renderer: InkRenderer | null;
   private readonly getTheme: () => ThemeMode;
   private readonly applyTheme: (next: ThemeMode) => void;
   private readonly reducedMotionMql: MediaQueryList | null;
+  private readonly iframeClonerAllowed: boolean;
 
   private frame: ActiveFrame | null = null;
   private elapsedSeconds = 0;
@@ -131,6 +165,7 @@ export class InkTransition {
   private fadeRafId = 0;
   private cssFadeTimer = 0;
   private resizeTimer = 0;
+  private idleHandle = 0;
   private captureGen = 0;
   private capturing = false;
   private captureQueued = false;
@@ -138,7 +173,6 @@ export class InkTransition {
 
   private readonly onResize: () => void;
   private readonly onReducedMotionChange: () => void;
-  private readonly resizeObserver: ResizeObserver | null;
 
   constructor(options: InkTransitionOptions) {
     this.getTheme = options.getTheme;
@@ -147,20 +181,29 @@ export class InkTransition {
       typeof window !== 'undefined' && typeof window.matchMedia === 'function'
         ? window.matchMedia('(prefers-reduced-motion: reduce)')
         : null;
+    this.iframeClonerAllowed = canUseIframeCloner();
+
+    inkDebug('L', 'Ink overlay canvas mounted in DOM', {
+      connected: options.canvas.isConnected,
+      iframeClonerAllowed: this.iframeClonerAllowed,
+      origin: typeof window !== 'undefined' ? window.origin : 'unknown',
+    });
 
     this.onResize = () => {
       if (this.disposed) return;
       this.renderer?.resize(renderScale());
       if (this.frame) this.draw();
-      this.scheduleCapture(RESIZE_DEBOUNCE_MS);
+      if (this.iframeClonerAllowed) {
+        this.scheduleCapture(RESIZE_DEBOUNCE_MS);
+      }
     };
 
     this.onReducedMotionChange = () => {
       if (this.disposed) return;
       if (this.prefersReducedMotion()) {
         this.cancel();
-      } else {
-        this.scheduleCapture(0);
+      } else if (this.iframeClonerAllowed) {
+        this.scheduleIdlePreload();
       }
     };
 
@@ -169,7 +212,7 @@ export class InkTransition {
 
     if (!this.renderer) {
       document.documentElement.dataset.ink = 'css';
-      this.resizeObserver = null;
+      inkDebug('Q', 'WebGL2 unavailable at init — CSS fallback armed');
       return;
     }
 
@@ -177,7 +220,9 @@ export class InkTransition {
     this.renderer.resize(renderScale());
     this.renderer.watchContext(
       () => this.cancel(),
-      () => this.scheduleCapture(0)
+      () => {
+        if (this.iframeClonerAllowed) this.scheduleCapture(0);
+      }
     );
 
     window.addEventListener('resize', this.onResize, { passive: true });
@@ -186,26 +231,18 @@ export class InkTransition {
       this.onReducedMotionChange
     );
 
-    // Re-capture when document height changes (late images, Gumroad catalogue injection, FAQ accordion).
-    if (typeof ResizeObserver !== 'undefined') {
-      this.resizeObserver = new ResizeObserver(() => {
-        if (!this.disposed) {
-          this.scheduleCapture(RESIZE_DEBOUNCE_MS);
-        }
-      });
-      this.resizeObserver.observe(document.body);
-    } else {
-      this.resizeObserver = null;
-    }
-
-    // Kick off offscreen pre-capture once fonts settle (skipped if reduced motion is on).
-    const startCapture = () => {
-      if (!this.disposed) this.scheduleCapture(0);
-    };
-    if (document.fonts && typeof document.fonts.ready?.then === 'function') {
-      void document.fonts.ready.then(startCapture);
-    } else {
-      startCapture();
+    // Preload html2canvas-pro and viewport snapshots only when iframe cloning is permitted.
+    // Inside Gumroad's opaque-origin CSP sandbox, we skip html2canvas-pro completely so
+    // it never stalls, and use the instant zero-iframe direct viewport rasterizer instead.
+    if (this.iframeClonerAllowed && !this.prefersReducedMotion()) {
+      const startIdle = () => {
+        if (!this.disposed) this.scheduleIdlePreload();
+      };
+      if (document.fonts && typeof document.fonts.ready?.then === 'function') {
+        void document.fonts.ready.then(startIdle);
+      } else {
+        startIdle();
+      }
     }
   }
 
@@ -228,56 +265,121 @@ export class InkTransition {
     if (this.disposed) return;
     const current = this.getTheme();
     const to = toggleThemeValue(current);
-    const renderer = this.renderer;
-    const scale = renderScale();
-    const key = layoutKey(scale);
-    const interrupting = this.frame !== null;
 
-    const canAnimate =
-      renderer !== null &&
-      !renderer.isLost &&
-      !this.prefersReducedMotion() &&
-      renderer.hasValid(to, key) &&
-      (interrupting || renderer.hasValid(current, key));
+    inkDebug('A', 'Theme toggle received', {
+      origin: { x: Math.round(point.x), y: Math.round(point.y) },
+      currentTheme: current,
+    });
+    inkDebug('B', 'Target theme determined', { targetTheme: to });
 
-    if (!canAnimate || !renderer) {
+    if (this.prefersReducedMotion()) {
+      inkDebug('Q', 'Fallback activated: prefers-reduced-motion is enabled');
       this.cancel();
       this.crossFade(to);
-      if (renderer && !this.prefersReducedMotion()) {
-        this.scheduleCapture(0);
-      }
       return;
     }
 
-    // If interrupted mid-spread, freeze what is currently on screen and spread the new ink over it.
-    let from: InkSource = current;
-    if (interrupting) {
-      this.stopLoops();
-      renderer.resize(scale);
-      const frozen = this.currentFrame();
-      from = frozen && renderer.freeze(frozen) ? 'composite' : current;
+    const renderer = this.renderer;
+    if (!renderer || renderer.isLost) {
+      inkDebug('Q', 'Fallback activated: WebGL2 renderer unavailable or context lost');
+      this.cancel();
+      this.crossFade(to);
+      return;
     }
 
-    const maxDist = farthestCorner(
-      point,
-      document.documentElement.clientWidth,
-      document.documentElement.clientHeight
-    );
+    const scale = renderScale();
+    const key = viewportKey(scale);
+    const interrupting = this.frame !== null;
+    const hasDualSnapshots =
+      renderer.hasValid(to, key) &&
+      (interrupting || renderer.hasValid(current, key));
+
+    let from: InkSource = current;
+    let revealAlpha = false;
+
+    if (hasDualSnapshots) {
+      // Path 1: Pre-captured dual-theme viewport snapshots are ready.
+      if (interrupting) {
+        this.stopLoops();
+        renderer.resize(scale);
+        const frozen = this.currentFrame();
+        from = frozen && renderer.freeze(frozen) ? 'composite' : current;
+      }
+    } else {
+      // Path 2: Instant zero-iframe direct viewport capture + live-DOM alpha-reveal WebGL2 ink.
+      // Works immediately on first click and inside Gumroad's strict CSP sandboxed iframe.
+      if (interrupting) {
+        this.hide();
+      }
+      try {
+        const snapshot = rasterizeViewport(
+          current,
+          scale,
+          renderer.maxTextureSize
+        );
+        const uploaded = renderer.upload(snapshot);
+        if (!uploaded) {
+          throw new Error('WebGL2 texture upload returned false');
+        }
+        from = current;
+        revealAlpha = true;
+      } catch (err) {
+        inkDebugError(
+          'Q',
+          'Fallback activated: direct viewport rasterization/upload failed',
+          err
+        );
+        this.cancel();
+        this.crossFade(to);
+        return;
+      }
+    }
+
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const vh = document.documentElement.clientHeight || window.innerHeight;
+    const maxDist = farthestCorner(point, vw, vh);
     const seed = randomSeed();
 
-    this.frame = { from, to, center: point, maxDist, seed };
+    this.frame = { from, to, revealAlpha, center: point, maxDist, seed };
     this.elapsedSeconds = 0;
 
     renderer.resize(scale);
-    this.draw();
+    const drewFirst = this.draw();
+    if (!drewFirst) {
+      inkDebug('Q', 'Fallback activated: initial WebGL2 draw failed');
+      this.cancel();
+      this.crossFade(to);
+      return;
+    }
 
-    // Same task: show the overlay (displaying "from") and flip the live DOM underneath.
+    // Same task: show the overlay (displaying the old theme) and flip the live DOM underneath.
     renderer.canvas.style.opacity = '1';
     renderer.canvas.classList.add('is-active');
+
+    const canvasRect = renderer.canvas.getBoundingClientRect();
+    const canvasStyle = window.getComputedStyle(renderer.canvas);
+    inkDebug('M', 'Ink canvas activated', {
+      mode: revealAlpha ? 'webgl-alpha-reveal' : 'webgl-dual-texture',
+      visibility: canvasStyle.visibility,
+      opacity: canvasStyle.opacity,
+      zIndex: canvasStyle.zIndex,
+      rect: {
+        width: Math.round(canvasRect.width),
+        height: Math.round(canvasRect.height),
+      },
+      backingStore: {
+        width: renderer.canvas.width,
+        height: renderer.canvas.height,
+      },
+    });
+
     this.applyTheme(to);
+    inkDebug('P', 'Target theme committed to live DOM', { theme: to });
 
     const duration = inkParams.duration;
     let lastTimestamp = performance.now();
+    let loggedFirstFrame = false;
+    let loggedMidpoint = false;
 
     const step = (now: number) => {
       if (this.disposed || !this.frame) return;
@@ -285,10 +387,29 @@ export class InkTransition {
       lastTimestamp = now;
       this.elapsedSeconds += dt * inkParams.timeScale;
 
+      if (!loggedFirstFrame) {
+        loggedFirstFrame = true;
+        inkDebug('N', 'First animation frame rendered', {
+          elapsedMs: Number((this.elapsedSeconds * 1000).toFixed(1)),
+        });
+      }
+
+      if (!loggedMidpoint && this.elapsedSeconds >= duration * 0.5) {
+        loggedMidpoint = true;
+        inkDebug('O', 'Animation reached midpoint', {
+          progress: Number(
+            easePower3Out(this.elapsedSeconds / duration).toFixed(3)
+          ),
+        });
+      }
+
       if (this.elapsedSeconds >= duration) {
         this.elapsedSeconds = duration;
         this.draw();
         this.rafId = 0;
+        inkDebug('O', 'Ink spread completed — starting overlay fade-out', {
+          durationS: duration,
+        });
         this.finish();
         return;
       }
@@ -305,6 +426,8 @@ export class InkTransition {
     this.disposed = true;
     this.captureGen++;
     this.cancel();
+    cancelIdle(this.idleHandle);
+    this.idleHandle = 0;
     window.clearTimeout(this.cssFadeTimer);
     window.clearTimeout(this.resizeTimer);
     document.documentElement.classList.remove('theme-fade');
@@ -313,7 +436,6 @@ export class InkTransition {
       'change',
       this.onReducedMotionChange
     );
-    this.resizeObserver?.disconnect();
     this.renderer?.dispose();
   }
 
@@ -346,11 +468,12 @@ export class InkTransition {
     };
   }
 
-  private draw(): void {
+  private draw(): boolean {
     const frame = this.currentFrame();
     if (this.renderer && frame) {
-      this.renderer.draw(frame);
+      return this.renderer.draw(frame);
     }
+    return false;
   }
 
   private finish(): void {
@@ -361,7 +484,8 @@ export class InkTransition {
     }
 
     const fadeStart = performance.now();
-    const fadeDurationMs = (FADE_OUT_S * 1000) / Math.max(0.01, inkParams.timeScale);
+    const fadeDurationMs =
+      (FADE_OUT_S * 1000) / Math.max(0.01, inkParams.timeScale);
 
     const fadeStep = (now: number) => {
       if (this.disposed || !this.frame) return;
@@ -369,6 +493,7 @@ export class InkTransition {
       canvas.style.opacity = String(1 - t);
       if (t >= 1) {
         this.fadeRafId = 0;
+        inkDebug('O', 'Overlay fade-out completed and cleaned up');
         this.hide();
         return;
       }
@@ -385,7 +510,7 @@ export class InkTransition {
       this.renderer.canvas.classList.remove('is-active');
       this.renderer.canvas.style.opacity = '';
     }
-    if (this.captureQueued && !this.disposed) {
+    if (this.captureQueued && this.iframeClonerAllowed && !this.disposed) {
       this.scheduleCapture(0);
     }
   }
@@ -398,33 +523,48 @@ export class InkTransition {
   /**
    * Fallback theme switch:
    * - Reduced motion: instant, accessible flip with no animation.
-   * - No WebGL2 or pre-capture still in progress: smooth CSS color cross-fade.
+   * - WebGL2 unavailable/lost: brief scoped CSS color cross-fade.
    */
   private crossFade(to: ThemeMode): void {
     const root = document.documentElement;
     if (this.prefersReducedMotion()) {
       root.classList.remove('theme-fade');
       this.applyTheme(to);
+      inkDebug('P', 'Final theme committed (reduced motion)', { theme: to });
       return;
     }
 
     root.classList.add('theme-fade');
     root.style.setProperty('--theme-fade', `${CSS_FADE_S}s`);
     this.applyTheme(to);
+    inkDebug('P', 'Final theme committed (CSS fallback)', { theme: to });
 
     window.clearTimeout(this.cssFadeTimer);
     this.cssFadeTimer = window.setTimeout(() => {
       root.classList.remove('theme-fade');
-      if (this.captureQueued && !this.disposed) {
-        this.scheduleCapture(0);
-      }
     }, CSS_FADE_S * 1000 + 50);
   }
 
-  // ---------- Capture scheduling ----------
+  // ---------- Idle preloading & viewport pre-capture (non-sandboxed hosts) ----------
+
+  private scheduleIdlePreload(): void {
+    if (this.disposed || !this.iframeClonerAllowed) return;
+    cancelIdle(this.idleHandle);
+    this.idleHandle = scheduleIdle(() => {
+      this.idleHandle = 0;
+      if (this.disposed || this.prefersReducedMotion()) return;
+      void loadHtml2CanvasPro()
+        .then(() => {
+          if (!this.disposed) this.scheduleCapture(0);
+        })
+        .catch(() => {
+          // Direct viewport rasterizer remains available even if CDN preload fails.
+        });
+    }, 1500);
+  }
 
   private scheduleCapture(delay: number): void {
-    if (this.disposed) return;
+    if (this.disposed || !this.iframeClonerAllowed) return;
     window.clearTimeout(this.resizeTimer);
     this.resizeTimer = window.setTimeout(() => {
       void this.captureAll();
@@ -433,10 +573,15 @@ export class InkTransition {
 
   private async captureAll(): Promise<void> {
     const renderer = this.renderer;
-    if (this.disposed || !renderer || renderer.isLost || this.prefersReducedMotion()) {
+    if (
+      this.disposed ||
+      !this.iframeClonerAllowed ||
+      !renderer ||
+      renderer.isLost ||
+      this.prefersReducedMotion()
+    ) {
       return;
     }
-    // Never capture mid-animation or mid CSS fade (would bake half-transitioned colors).
     if (
       this.capturing ||
       this.frame ||
@@ -447,7 +592,7 @@ export class InkTransition {
     }
 
     const scale = renderScale();
-    const key = layoutKey(scale);
+    const key = viewportKey(scale);
     const current = this.getTheme();
     const other = toggleThemeValue(current);
     const themes: ThemeMode[] = [current, other].filter(
@@ -464,15 +609,14 @@ export class InkTransition {
         if (this.disposed || gen !== this.captureGen) return;
         const snap = await capturePage(theme, scale, renderer.maxTextureSize);
         if (this.disposed || gen !== this.captureGen) return;
-        if (snap.key !== layoutKey(renderScale())) {
-          // Layout changed while capturing; this snapshot is already stale.
+        if (snap.key !== viewportKey(renderScale())) {
           this.captureQueued = true;
           break;
         }
         renderer.upload(snap);
       }
     } catch {
-      // Snapshot capture failure gracefully degrades to CSS cross-fade fallback.
+      // Direct viewport rasterizer handles transitions cleanly without stalling.
     } finally {
       this.capturing = false;
     }
