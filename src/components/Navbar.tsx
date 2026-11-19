@@ -1,4 +1,4 @@
-import { useEffect, useState, type MouseEvent } from 'react';
+import { useEffect, useState } from 'react';
 import { Menu, Moon, Sun, X } from 'lucide-react';
 import { NAV_PAGES, STUDIO_PROFILE, type PageSlug } from '../data/studioData';
 import type { ThemeMode } from '../utils/theme';
@@ -7,7 +7,7 @@ import { DoodleSquiggle } from './DoodleMotifs';
 interface NavbarProps {
   activePage: PageSlug;
   theme: ThemeMode;
-  onToggleTheme: (event: MouseEvent<HTMLButtonElement>) => void;
+  onToggleTheme: () => void;
 }
 
 export function Navbar({ activePage, theme, onToggleTheme }: NavbarProps) {

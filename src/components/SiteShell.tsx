@@ -1,13 +1,5 @@
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type MouseEvent,
-  type ReactNode,
-} from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import type { PageSlug } from '../data/studioData';
-import { InkTransition, resolveToggleOrigin } from '../ink/inkTransition';
 import {
   resolveInitialTheme,
   THEME_STORAGE_KEY,
@@ -62,64 +54,22 @@ export function SiteShell({
   children,
 }: SiteShellProps) {
   const [theme, setTheme] = useState<ThemeMode>(getInitialTheme);
-  const themeRef = useRef<ThemeMode>(theme);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const transitionRef = useRef<InkTransition | null>(null);
 
-  // Sync initial resolved theme to document class without overriding an unset user preference
+  // Keep document class synced with resolved initial theme without overwriting unset storage
   useEffect(() => {
-    themeRef.current = theme;
     syncThemeToDocument(theme, false);
   }, [theme]);
 
-  const applyThemeImmediate = useCallback((next: ThemeMode) => {
-    themeRef.current = next;
-    syncThemeToDocument(next, true);
-    setTheme(next);
-  }, []);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const controller = new InkTransition({
-      canvas,
-      getTheme: () => themeRef.current,
-      applyTheme: applyThemeImmediate,
+  const handleToggleTheme = useCallback(() => {
+    setTheme((current) => {
+      const next = toggleThemeValue(current);
+      syncThemeToDocument(next, true);
+      return next;
     });
-    transitionRef.current = controller;
-
-    return () => {
-      controller.dispose();
-      if (transitionRef.current === controller) {
-        transitionRef.current = null;
-      }
-    };
-  }, [applyThemeImmediate]);
-
-  const handleToggleTheme = useCallback(
-    (event: MouseEvent<HTMLButtonElement>) => {
-      const controller = transitionRef.current;
-      if (!controller) {
-        applyThemeImmediate(toggleThemeValue(themeRef.current));
-        return;
-      }
-
-      const rect = event.currentTarget.getBoundingClientRect();
-      const origin = resolveToggleOrigin(
-        event.nativeEvent,
-        rect,
-        { width: window.innerWidth, height: window.innerHeight }
-      );
-      controller.toggle(origin);
-    },
-    [applyThemeImmediate]
-  );
+  }, []);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#FFF7E8] text-[#24211D] dark:bg-[#181613] dark:text-[#F5EDE0]">
-      <canvas ref={canvasRef} className="ink-canvas" aria-hidden="true" />
-
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:px-4 focus:py-2 focus:bg-[#4169E1] focus:text-white rounded-md text-sm font-semibold"
