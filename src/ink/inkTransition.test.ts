@@ -1,12 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  HTML2CANVAS_PRO_CDN_URL,
+  HTML2CANVAS_PRO_VERSION,
+} from './capture';
+import {
   computeSpreadMetrics,
   easePower3Out,
   farthestCorner,
   resolveToggleOrigin,
 } from './inkTransition';
 import { inkParams, RIM_COLOR, SPREAD, THEME_BG } from './params';
+
+test('HTML2CANVAS_PRO_CDN_URL uses a pinned versioned jsDelivr ESM URL', () => {
+  assert.match(HTML2CANVAS_PRO_VERSION, /^\d+\.\d+\.\d+$/);
+  assert.equal(
+    HTML2CANVAS_PRO_CDN_URL,
+    `https://cdn.jsdelivr.net/npm/html2canvas-pro@${HTML2CANVAS_PRO_VERSION}/+esm`
+  );
+  assert.ok(!HTML2CANVAS_PRO_CDN_URL.includes('@latest'));
+});
 
 test('easePower3Out matches exact cubic out easing boundaries and monotonicity', () => {
   assert.equal(easePower3Out(0), 0);

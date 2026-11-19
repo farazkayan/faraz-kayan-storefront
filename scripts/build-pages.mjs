@@ -6,12 +6,19 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { build } from 'vite';
 
+// Ensure React & Vite always emit production builds even when invoked from a dev shell.
+process.env.NODE_ENV = 'production';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
 const TMP_BASE_DIR = path.join(DIST_DIR, '_tmp');
 
 const PAGES = ['profile', 'about', 'faq'];
+
+const GUMROAD_HARD_CHAR_LIMIT = 500_000;
+const GUMROAD_FAIL_CHAR_LIMIT = 480_000;
+const GUMROAD_TARGET_CHAR_LIMIT = 450_000;
 
 const PAGE_PARITY_MARKERS = {
   common: [
@@ -104,6 +111,14 @@ function auditStandaloneHtml(pageName, html) {
     }
   }
 
+  const charCount = html.length;
+  const byteCount = Buffer.byteLength(html, 'utf8');
+  if (charCount >= GUMROAD_FAIL_CHAR_LIMIT) {
+    issues.push(
+      `Exported HTML length (${charCount.toLocaleString()} chars / ${byteCount.toLocaleString()} bytes) reached or exceeded safety limit of ${GUMROAD_FAIL_CHAR_LIMIT.toLocaleString()} chars (Gumroad hard max: ${GUMROAD_HARD_CHAR_LIMIT.toLocaleString()} chars).`
+    );
+  }
+
   if (issues.length > 0) {
     throw new Error(
       `Standalone HTML audit failed for ${pageName}.html:\n- ${issues.join('\n- ')}`
@@ -119,6 +134,7 @@ async function buildSinglePage(pageName) {
 
   await build({
     configFile: false,
+    mode: 'production',
     root: ROOT_DIR,
     logLevel: 'silent',
     plugins: [react(), tailwindcss()],
@@ -136,7 +152,7 @@ async function buildSinglePage(pageName) {
       rollupOptions: {
         input: entryHtml,
         output: {
-          inlineDynamicImports: true,
+          codeSplitting: false,
         },
       },
     },
@@ -225,17 +241,40 @@ async function verifySynchronizedExports() {
       }
     }
 
-    auditStandaloneHtml(pageName, rootBuf.toString('utf8'));
+    const htmlText = rootBuf.toString('utf8');
+    auditStandaloneHtml(pageName, htmlText);
+
+    const charCount = htmlText.length;
+    const byteCount = Buffer.byteLength(htmlText, 'utf8');
+    const limitStatus =
+      charCount <= GUMROAD_TARGET_CHAR_LIMIT
+        ? `OK (${(GUMROAD_HARD_CHAR_LIMIT - charCount).toLocaleString()} chars headroom)`
+        : `WARN (> ${GUMROAD_TARGET_CHAR_LIMIT.toLocaleString()} target, ${(GUMROAD_HARD_CHAR_LIMIT - charCount).toLocaleString()} below max)`;
 
     summaries.push({
       file: `${pageName}.html`,
-      sizeKb: (rootBuf.length / 1024).toFixed(1),
+      chars: charCount,
+      bytes: byteCount,
+      sizeKb: (byteCount / 1024).toFixed(1),
+      limitStatus,
       hash: sha256Short(rootBuf),
       mtime: rootStat.mtime.toISOString(),
     });
   }
 
   console.log('\nSynchronized Gumroad Standalone Exports (root === dist):');
+  console.log(
+    '  Page          | Characters | Bytes      | Gumroad limit status'
+  );
+  console.log(
+    '  --------------|------------|------------|---------------------------------------------'
+  );
+  for (const item of summaries) {
+    console.log(
+      `  ${item.file.padEnd(13)} | ${item.chars.toLocaleString().padStart(10)} | ${item.bytes.toLocaleString().padStart(10)} | ${item.limitStatus}`
+    );
+  }
+  console.log('');
   for (const item of summaries) {
     console.log(
       `  ✓ ${item.file.padEnd(13)} ${item.sizeKb.padStart(6)} kB  sha256:${item.hash}  mtime:${item.mtime}`

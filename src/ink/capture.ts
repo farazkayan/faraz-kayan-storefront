@@ -10,8 +10,43 @@
  * offset. The theme class is applied to html2canvas-pro's cloned document via `onclone`,
  * so the live page never flickers during pre-capture.
  */
+import type html2canvasType from 'html2canvas-pro';
 import type { ThemeMode } from '../utils/theme';
 import { THEME_BG } from './params';
+
+export const HTML2CANVAS_PRO_VERSION = '2.6.4';
+export const HTML2CANVAS_PRO_CDN_URL = `https://cdn.jsdelivr.net/npm/html2canvas-pro@${HTML2CANVAS_PRO_VERSION}/+esm`;
+
+type Html2CanvasFn = typeof html2canvasType;
+
+let html2canvasPromise: Promise<Html2CanvasFn> | null = null;
+
+/**
+ * Loads html2canvas-pro at runtime from the pinned jsDelivr ESM CDN.
+ * Cached after first successful load so it is downloaded at most once per page.
+ * Clears the cached promise on failure so transient network issues do not stick.
+ */
+export function loadHtml2CanvasPro(): Promise<Html2CanvasFn> {
+  if (!html2canvasPromise) {
+    const moduleUrl = HTML2CANVAS_PRO_CDN_URL;
+    html2canvasPromise = (
+      import(/* @vite-ignore */ moduleUrl) as Promise<{
+        default?: Html2CanvasFn;
+      }>
+    )
+      .then((mod) => {
+        if (typeof mod?.default !== 'function') {
+          throw new Error('html2canvas-pro ESM module did not export default function');
+        }
+        return mod.default;
+      })
+      .catch((err) => {
+        html2canvasPromise = null;
+        throw err;
+      });
+  }
+  return html2canvasPromise;
+}
 
 export interface Snapshot {
   theme: ThemeMode;
@@ -67,8 +102,8 @@ export async function capturePage(
     Math.min(scale, maxTextureSize / width, maxTextureSize / height)
   );
 
-  // Lazy-loaded so initial paint is never blocked.
-  const { default: html2canvas } = await import('html2canvas-pro');
+  // Loaded at runtime from pinned jsDelivr ESM so standalone HTML stays under Gumroad's 500k char limit.
+  const html2canvas = await loadHtml2CanvasPro();
   const canvas = await html2canvas(document.body, {
     scale: safeScale,
     backgroundColor: THEME_BG[theme],
